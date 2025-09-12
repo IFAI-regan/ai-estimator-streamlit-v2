@@ -136,28 +136,30 @@ def list_tasks(eq: Optional[str], comp: Optional[str]) -> List[str]:
     return df["task_name"].tolist() if not df.empty else []
 
 # -----------------------------
-# Inputs (cascading selectboxes)
+# Inputs (cascading selectboxes) — SAFE pattern (no widget keys)
 # -----------------------------
 colA, colB = st.columns(2)
 
-st.session_state[EQ_KEY] = colA.selectbox(
+eq_value = colA.selectbox(
     "Equipment Class",
     options=list_equipment(),
     index=None,
     placeholder="Type to search… e.g., Stacker Reclaimer",
-    key=EQ_KEY,
 )
 
-st.session_state[COMP_KEY] = colB.selectbox(
+# update session state after the widget returns
+st.session_state[EQ_KEY] = eq_value
+
+comp_value = colB.selectbox(
     "Component",
     options=list_components(st.session_state[EQ_KEY]),
     index=None,
     placeholder="Select component…",
     disabled=(st.session_state[EQ_KEY] is None),
-    key=COMP_KEY,
 )
+st.session_state[COMP_KEY] = comp_value
 
-st.session_state[TASK_KEY] = st.selectbox(
+task_value = st.selectbox(
     "Task Name (exact)",
     options=list_tasks(st.session_state[EQ_KEY], st.session_state[COMP_KEY]),
     index=None,
@@ -167,23 +169,8 @@ st.session_state[TASK_KEY] = st.selectbox(
         else "Select a task…"
     ),
     disabled=not (st.session_state[EQ_KEY] and st.session_state[COMP_KEY]),
-    key=TASK_KEY,
 )
-
-# Action buttons
-a1, a2 = st.columns([1, 1])
-lookup_disabled = not (st.session_state[EQ_KEY] and st.session_state[COMP_KEY] and st.session_state[TASK_KEY])
-
-with a1:
-    do_lookup = st.button("Lookup", type="primary", disabled=lookup_disabled)
-
-with a2:
-    if st.button("Clear selections"):
-        st.session_state[EQ_KEY] = None
-        st.session_state[COMP_KEY] = None
-        st.session_state[TASK_KEY] = None
-        st.session_state[LAST_KEY] = None
-        st.rerun()
+st.session_state[TASK_KEY] = task_value
 
 # -----------------------------
 # Lookup & present
