@@ -1,114 +1,157 @@
-# app.py
 import os
 from io import StringIO
+from textwrap import dedent
 
 import pandas as pd
 import psycopg2
-import psycopg2.extras as pe
+import psycopg2.extras
 import streamlit as st
 
-# -------------------- Page & styles --------------------
+# =========================
+# Page & Global Styles
+# =========================
 st.set_page_config(page_title="Phase 1 — Exact Name Recall", layout="wide")
 
+# ---- CSS: layout + look (safe to tweak) ----
 st.markdown(
-    """
-    <style>
-      .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-      /* Make the left column look like a sidebar card */
-      div[data-testid="stHorizontalBlock"] > div:nth-child(1) {
-        background: #f5f7fa;
-        padding: 16px 16px 18px;
-        border-radius: 12px;
-        box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
-        min-height: 86vh;
-      }
-      /* Tighten selects/buttons a bit */
-      div[data-baseweb="select"] > div { min-height: 40px; }
-      button[kind="secondary"] { color:#334; }
-      .metric-val { font-size: 32px; font-weight: 600; }
-    </style>
-    """,
+    dedent(
+        """
+        <style>
+          /* General rhythm */
+          .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+
+          /* Grid: sidebar + main */
+          .app-grid {
+            display: grid;
+            grid-template-columns: 360px 1fr;
+            grid-gap: 24px;
+            align-items: start;
+          }
+
+          /* Sticky sidebar panel */
+          .panel--sidebar {
+            position: sticky; top: 92px;
+            max-height: calc(100vh - 120px);
+            overflow: auto;
+
+            background: #f4f6f8;
+            border: 1px solid #e7ecf2;
+            border-radius: 12px;
+            padding: 18px 16px;
+          }
+
+          /* Smaller inner spacing for inputs */
+          .panel--sidebar .stSelectbox, 
+          .panel--sidebar .stTextInput, 
+          .panel--sidebar .stMultiSelect {
+            margin-bottom: .35rem;
+          }
+
+          /* Row of buttons in the sidebar */
+          .btn-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-gap: 10px;
+            margin-top: 8px;
+          }
+
+          /* Metrics: 3 equal cards */
+          .metrics-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            grid-gap: 16px;
+            margin: 12px 0 24px 0;
+          }
+          .metric-card {
+            background: #f8fafc;
+            border: 1px solid #e7ecf2;
+            border-radius: 12px;
+            padding: 18px 16px;
+            min-height: 110px;
+          }
+          .metric-card h4 {
+            margin: 0 0 6px 0; font-weight: 600; font-size: 0.95rem; color: #4a5568;
+          }
+          .metric-card .big {
+            font-size: 1.8rem; font-weight: 700; color: #1f2937;
+          }
+
+          /* Divider spacing */
+          .pad-top { margin-top: 12px; }
+
+          /* Estimate container */
+          .estimate-box {
+            background: #fbfcfe;
+            border: 1px solid #e7ecf2;
+            border-radius: 12px;
+            padding: 14px;
+          }
+        </style>
+        """
+    ),
     unsafe_allow_html=True,
 )
 
-st.title("Phase 1 — Exact Name Recall")
-
-# -------------------- Secrets / DB --------------------
-# Required secrets in Streamlit Cloud:
-# DATABASE_URL = "postgresql://postgres.<project>:<PASSWORD>@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
-# VIEW_FQN     = "demo_v2.task_norms_view"
-VIEW_FQN = st.secrets.get("VIEW_FQN", "demo_v2.task_norms_view")
-DB_URL   = st.secrets.get("DATABASE_URL", "")
-
-if not DB_URL:
+# =========================
+# DB connection via secrets
+# =========================
+if "DATABASE_URL" not in st.secrets or "VIEW_FQN" not in st.secrets:
     st.error(
-        "Missing secret `DATABASE_URL`.\n\n"
-        "In app **Settings → Secrets** add something like:\n"
-        '`DATABASE_URL = "postgresql://postgres.<project>:[PASSWORD]@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"`'
+        "Missing secrets. Please add `DATABASE_URL` and `VIEW_FQN` in **Settings → Secrets**.\n\n"
+        "Example:\n"
+        'DATABASE_URL = "postgresql://postgres.<project>:[PASSWORD]@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"\n'
+        'VIEW_FQN     = "demo_v2.task_norms_view"'
     )
     st.stop()
 
-@st.cache_resource(show_spinner=False)
+DATABASE_URL = st.secrets["DATABASE_URL"].strip()
+VIEW_FQN = st.secrets["VIEW_FQN"].strip()
+
+
+@st.cache_resource
 def get_conn():
-    return psycopg2.connect(DB_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-@st.cache_data(show_spinner=False, ttl=600)
+
 def run_sql(query: str, params=None) -> pd.DataFrame:
-    with get_conn() as conn, conn.cursor(cursor_factory=pe.RealDictCursor) as cur:
+    with get_conn() as conn, conn.cursor(
+        cursor_factory=psycopg2.extras.RealDictCursor
+    ) as cur:
         cur.execute(query, params or [])
-        rows = cur.fetchall() if cur.description else []
-        return pd.DataFrame(rows)
+        if cur.description is None:
+            return pd.DataFrame()
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=[d.name for d in cur.description])
 
-# Connection check
+
+# quick sanity check
+ok = True
 try:
-    _ = run_sql("select 1;")
-    st.success("Database connection OK")
-except Exception as e:
-    st.error("Could not connect to database.")
-    st.caption(type(e).__name__)
-    st.stop()
+    _ = run_sql("select 1 as ok;")
+except Exception:
+    ok = False
 
-# -------------------- Session state --------------------
+# =========================
+# State
+# =========================
 if "estimate" not in st.session_state:
-    st.session_state.estimate = []
+    st.session_state.estimate: list[dict] = []
 
 if "last_lookup" not in st.session_state:
-    st.session_state.last_lookup = None
+    st.session_state.last_lookup: dict | None = None
 
-def add_to_estimate(line: dict) -> bool:
-    for existing in st.session_state.estimate:
-        if (
-            existing.get("equipment_class") == line.get("equipment_class")
-            and existing.get("component") == line.get("component")
-            and existing.get("task_name") == line.get("task_name")
-        ):
-            return False
-    st.session_state.estimate.append(line)
-    return True
 
-def estimate_df() -> pd.DataFrame:
-    if not st.session_state.estimate:
-        return pd.DataFrame(
-            columns=[
-                "row","equipment_class","component","task_name","task_code",
-                "base_duration_hr","cost_per_hour","total_cost",
-                "crew_roles","crew_count","notes"
-            ]
-        )
-    df = pd.DataFrame(st.session_state.estimate).copy()
-    for c in ["base_duration_hr","cost_per_hour","total_cost"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df.insert(0, "row", range(1, len(df) + 1))
-    return df
-
-# -------------------- Helper lists --------------------
-@st.cache_data(ttl=600, show_spinner=False)
+# =========================
+# Helper queries for dropdowns
+# =========================
 def list_equipment() -> list[str]:
-    df = run_sql(f"SELECT DISTINCT equipment_class FROM {VIEW_FQN} ORDER BY equipment_class;")
+    df = run_sql(
+        f"SELECT DISTINCT equipment_class FROM {VIEW_FQN} ORDER BY equipment_class;"
+    )
     return df["equipment_class"].tolist() if not df.empty else []
 
-@st.cache_data(ttl=600, show_spinner=False)
-def list_components(eq: str) -> list[str]:
+
+def list_components(eq: str | None) -> list[str]:
     if not eq:
         return []
     df = run_sql(
@@ -122,15 +165,16 @@ def list_components(eq: str) -> list[str]:
     )
     return df["component"].tolist() if not df.empty else []
 
-@st.cache_data(ttl=600, show_spinner=False)
-def list_tasks(eq: str, comp: str) -> list[str]:
+
+def list_tasks(eq: str | None, comp: str | None) -> list[str]:
     if not (eq and comp):
         return []
     df = run_sql(
         f"""
         SELECT task_name
         FROM {VIEW_FQN}
-        WHERE equipment_class = %s AND component = %s
+        WHERE equipment_class = %s
+          AND component = %s
         GROUP BY task_name
         ORDER BY task_name;
         """,
@@ -138,215 +182,267 @@ def list_tasks(eq: str, comp: str) -> list[str]:
     )
     return df["task_name"].tolist() if not df.empty else []
 
-# -------------------- Layout: two columns --------------------
-left, right = st.columns([0.95, 2.05], gap="large")
 
-with left:
-    st.header("Find a task", divider=False)
+# =========================
+# Page Structure
+# =========================
+st.title("Phase 1 — Exact Name Recall")
+if ok:
+    st.success("Database connection OK")
+else:
+    st.error("Could not connect to database.")
+    st.stop()
 
-    equipment = st.selectbox(
-        "Equipment Class",
-        options=list_equipment(),
-        index=None,
-        placeholder="Type to search… e.g., Stacker Reclaimer",
+st.caption(f"Supabase → `{VIEW_FQN}`")
+
+# Grid container
+st.markdown('<div class="app-grid">', unsafe_allow_html=True)
+
+# ---------- LEFT: Find a task (sticky sidebar) ----------
+st.markdown('<div class="panel--sidebar">', unsafe_allow_html=True)
+st.subheader("Find a task")
+
+# Inputs
+equipment = st.selectbox(
+    "Equipment Class",
+    options=list_equipment(),
+    index=None,
+    placeholder="Type to search… e.g., Stacker Reclaimer",
+)
+component = st.selectbox(
+    "Component",
+    options=list_components(equipment),
+    index=None,
+    placeholder="Select component…",
+    disabled=(equipment is None),
+)
+task_name = st.selectbox(
+    "Task Name (exact)",
+    options=list_tasks(equipment, component),
+    index=None,
+    placeholder=(
+        "Select equipment & component first"
+        if not (equipment and component)
+        else "Select a task…"
+    ),
+    disabled=not (equipment and component),
+)
+
+# Buttons row
+lookup_disabled = not (equipment and component and task_name)
+col_lookup, col_clear = st.columns(2)
+with col_lookup:
+    do_lookup = st.button("Lookup", type="primary", use_container_width=True, disabled=lookup_disabled)
+with col_clear:
+    if st.button("Clear selections", use_container_width=True):
+        st.session_state.last_lookup = None
+        st.rerun()
+
+st.markdown("</div>", unsafe_allow_html=True)  # end sidebar
+
+# ---------- RIGHT: Main content ----------
+st.markdown('<div>', unsafe_allow_html=True)
+
+# --- Metrics Row (always shown, values update on lookup) ---
+def metric_card(label: str, value: str):
+    st.markdown(
+        f"""
+        <div class="metric-card">
+          <h4>{label}</h4>
+          <div class="big">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    component = st.selectbox(
-        "Component",
-        options=list_components(equipment) if equipment else [],
-        index=None,
-        disabled=equipment is None,
-        placeholder="Select component…",
+
+# Handle lookup
+if do_lookup:
+    df = run_sql(
+        f"""
+        SELECT *
+        FROM {VIEW_FQN}
+        WHERE equipment_class = %s
+          AND component = %s
+          AND task_name = %s;
+        """,
+        [equipment, component, task_name],
     )
 
-    task_name = st.selectbox(
-        "Task Name (exact)",
-        options=list_tasks(equipment, component) if (equipment and component) else [],
-        index=None,
-        disabled=not (equipment and component),
-        placeholder=("Select equipment & component first" if not (equipment and component) else "Select a task…"),
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        lookup_pressed = st.button("Lookup", use_container_width=True, type="primary",
-                                   disabled=not (equipment and component and task_name))
-    with c2:
-        if st.button("Clear selections", use_container_width=True):
-            st.session_state.last_lookup = None
-            st.rerun()
-
-with right:
-    # -------------------- Lookup result area --------------------
-    if "lookup_once" not in st.session_state:
-        st.session_state.lookup_once = 0  # just to force area creation
-    # execute lookup if asked
-    if 'lookup_pressed' in locals() and lookup_pressed:
-        df = run_sql(
-            f"""
-            SELECT *
-            FROM {VIEW_FQN}
-            WHERE equipment_class = %s
-              AND component = %s
-              AND task_name = %s;
-            """,
-            [equipment, component, task_name],
-        )
-        if df.empty:
-            st.warning("No exact match found.")
-            st.session_state.last_lookup = None
-        else:
-            # derive cost_per_hour + total_cost
-            cost_col = None
-            if "labour_rate" in df.columns:
-                cost_col = "labour_rate"
-            elif "blended_labour_rate" in df.columns:
-                cost_col = "blended_labour_rate"
-
-            if cost_col:
-                df["cost_per_hour"] = pd.to_numeric(df[cost_col], errors="coerce")
-            else:
-                df["cost_per_hour"] = None
-
-            if "base_duration_hr" in df.columns:
-                df["base_duration_hr"] = pd.to_numeric(df["base_duration_hr"], errors="coerce")
-                df["total_cost"] = (df["cost_per_hour"] * df["base_duration_hr"]).round(2)
-            else:
-                df["total_cost"] = None
-
-            st.session_state.last_lookup = df.iloc[0].to_dict()
-
-    row = st.session_state.last_lookup
-    if row:
-        # Metrics row
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.caption("Duration (hr)")
-            st.markdown(f"<div class='metric-val'>{float(row.get('base_duration_hr') or 0):.2f}</div>", unsafe_allow_html=True)
-        with m2:
-            st.caption("Cost per hour")
-            cph = float(row.get("cost_per_hour") or 0)
-            st.markdown(f"<div class='metric-val'>${cph:,.2f}</div>", unsafe_allow_html=True)
-        with m3:
-            st.caption("Total cost (per task)")
-            tot = float(row.get("total_cost") or 0)
-            st.markdown(f"<div class='metric-val'>${tot:,.2f}</div>", unsafe_allow_html=True)
-
-        # Crew bullets
-        st.subheader("Crew")
-        roles = str(row.get("crew_roles", "") or "").split("|")
-        counts = str(row.get("crew_count", "") or "").split("|")
-        crew_lines = []
-        for r, c in zip(roles, counts):
-            r = r.strip()
-            c = c.strip()
-            if r:
-                crew_lines.append(f"- **{r}** × {c or '1'}")
-        if crew_lines:
-            st.markdown("\n".join(crew_lines))
-        else:
-            st.caption("No crew information found.")
-
-        # One-row table (tidy)
-        tidy = pd.DataFrame([row]).copy()
-        for col_to_drop in ["blended_labour_rate", "labour_rate", "id"]:
-            if col_to_drop in tidy.columns:
-                tidy.drop(columns=[col_to_drop], inplace=True, errors="ignore")
-
-        cols_wanted = [
-            "task_code","equipment_class","component","task_name",
-            "base_duration_hr","cost_per_hour","total_cost",
-            "crew_roles","crew_count","notes","effective_from","effective_to"
-        ]
-        present = [c for c in cols_wanted if c in tidy.columns]
-        tidy = tidy[present + [c for c in tidy.columns if c not in present]]
-
-        st.subheader("Result (per task)")
-        st.dataframe(
-            tidy,
-            use_container_width=True,
-            column_config={
-                "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
-                "cost_per_hour":   st.column_config.NumberColumn("Cost/hr",     format="$%.2f"),
-                "total_cost":      st.column_config.NumberColumn("Cost/Task",   format="$%.2f"),
-            },
-            hide_index=True,
-        )
-
-        st.subheader("Add to estimate")
-        if st.button("➕ Add this task"):
-            line = {
-                "equipment_class": row.get("equipment_class"),
-                "component": row.get("component"),
-                "task_name": row.get("task_name"),
-                "task_code": row.get("task_code"),
-                "base_duration_hr": float(row.get("base_duration_hr") or 0),
-                "cost_per_hour": float(row.get("cost_per_hour") or 0),
-                "total_cost": float(row.get("total_cost") or 0),
-                "crew_roles": row.get("crew_roles"),
-                "crew_count": row.get("crew_count"),
-                "notes": row.get("notes"),
-            }
-            if add_to_estimate(line):
-                st.toast("Added to estimate ✅")
-            else:
-                st.toast("Already in estimate", icon="ℹ️")
-
-    # -------------------- Estimate cart --------------------
-    st.subheader("Estimate")
-    df_est = estimate_df()
-    if df_est.empty:
-        st.caption("No tasks added yet. Lookup a task and click **Add this task**.")
+    if df.empty:
+        st.warning("No exact match found.")
+        st.session_state.last_lookup = None
     else:
-        filter_text = st.text_input("Filter estimate (search across task / equipment / component):",
-                                    placeholder="Type to filter…")
-        display_df = df_est.copy()
-        if filter_text:
-            ft = filter_text.lower()
-            mask = (
-                display_df["task_name"].astype(str).str.lower().str.contains(ft)
-                | display_df["equipment_class"].astype(str).str.lower().str.contains(ft)
-                | display_df["component"].astype(str).str.lower().str.contains(ft)
-            )
-            display_df = display_df[mask]
+        # choose first row
+        row = df.iloc[0].to_dict()
 
-        subtotal = pd.to_numeric(display_df["total_cost"], errors="coerce").sum()
+        # derive cost_per_hour & total_cost
+        if "labour_rate" in df.columns:
+            cph = float(df.at[df.index[0], "labour_rate"] or 0)
+        elif "blended_labour_rate" in df.columns:
+            cph = float(df.at[df.index[0], "blended_labour_rate"] or 0)
+        else:
+            cph = 0.0
 
-        st.dataframe(
-            display_df[
-                [
-                    "row","equipment_class","component","task_name","task_code",
-                    "base_duration_hr","cost_per_hour","total_cost",
-                    "crew_roles","crew_count","notes",
-                ]
-            ],
+        dur = float(row.get("base_duration_hr") or 0)
+        tot = cph * dur if cph and dur else 0.0
+
+        row["cost_per_hour"] = cph
+        row["total_cost"] = round(tot, 2)
+
+        st.session_state.last_lookup = row
+
+# --- Metrics render (from last_lookup if available) ---
+lr = st.session_state.last_lookup or {}
+dur = float(lr.get("base_duration_hr") or 0)
+cph = float(lr.get("cost_per_hour") or 0)
+tot = float(lr.get("total_cost") or 0)
+
+st.markdown('<div class="metrics-row">', unsafe_allow_html=True)
+metric_card("Duration (hr)", f"{dur:.2f}" if dur else "—")
+metric_card("Cost per hour", f"${cph:,.2f}" if cph else "—")
+metric_card("Total cost (per task)", f"${tot:,.2f}" if tot else "—")
+st.markdown("</div>", unsafe_allow_html=True)
+
+# --- Result (per task) table (only if we have a row) ---
+if lr:
+    st.markdown("#### Result (per task)")
+    tidy_df = pd.DataFrame([lr]).copy()
+
+    # Hide raw pricing fields if present
+    for col_to_drop in ["blended_labour_rate", "labour_rate"]:
+        if col_to_drop in tidy_df.columns:
+            tidy_df.drop(columns=[col_to_drop], inplace=True)
+
+    # Nice order
+    wanted = [
+        "task_code",
+        "equipment_class",
+        "component",
+        "task_name",
+        "base_duration_hr",
+        "cost_per_hour",
+        "total_cost",
+        "crew_roles",
+        "crew_count",
+        "notes",
+        "effective_from",
+        "effective_to",
+    ]
+    present = [c for c in wanted if c in tidy_df.columns]
+    tidy_df = tidy_df[present + [c for c in tidy_df.columns if c not in present]]
+
+    st.dataframe(
+        tidy_df,
+        use_container_width=True,
+        column_config={
+            "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
+            "cost_per_hour": st.column_config.NumberColumn("Cost/hr", format="$%.2f"),
+            "total_cost": st.column_config.NumberColumn("Cost/Task", format="$%.2f"),
+            "crew_roles": st.column_config.TextColumn("Crew roles", help="Wrapped for readability", width="medium"),
+            "notes": st.column_config.TextColumn("Notes", help="Wrapped for readability", width="large"),
+        },
+        hide_index=True,
+    )
+
+    # Add to estimate
+    st.markdown("#### Add to estimate")
+    if st.button("➕ Add this task", type="secondary"):
+        line = {
+            "equipment_class": lr.get("equipment_class"),
+            "component": lr.get("component"),
+            "task_name": lr.get("task_name"),
+            "task_code": lr.get("task_code"),
+            "base_duration_hr": float(lr.get("base_duration_hr") or 0),
+            "cost_per_hour": float(lr.get("cost_per_hour") or 0),
+            "total_cost": float(lr.get("total_cost") or 0),
+            "crew_roles": lr.get("crew_roles"),
+            "crew_count": lr.get("crew_count"),
+            "notes": lr.get("notes"),
+        }
+        st.session_state.estimate.append(line)
+        st.toast("Added to estimate ✅")
+
+# Divider between result and estimate
+st.divider()
+
+# --- Estimate Section ---
+st.subheader("Estimate")
+if not st.session_state.estimate:
+    st.caption("No tasks added yet. Lookup a task and click **Add this task**.")
+else:
+    # Estimate filter
+    filter_text = st.text_input(
+        "Filter estimate (search across task / equipment / component):",
+        placeholder="Type to filter…",
+    )
+
+    df_est = pd.DataFrame(st.session_state.estimate)
+    if filter_text:
+        ft = filter_text.lower()
+        mask = (
+            df_est["task_name"].astype(str).str.lower().str.contains(ft)
+            | df_est["equipment_class"].astype(str).str.lower().str.contains(ft)
+            | df_est["component"].astype(str).str.lower().str.contains(ft)
+        )
+        df_est = df_est[mask]
+
+    # Subtotal
+    subtotal = pd.to_numeric(df_est["total_cost"], errors="coerce").sum()
+
+    # Distinct container
+    st.markdown('<div class="estimate-box">', unsafe_allow_html=True)
+    st.dataframe(
+        df_est[
+            [
+                "equipment_class",
+                "component",
+                "task_name",
+                "task_code",
+                "base_duration_hr",
+                "cost_per_hour",
+                "total_cost",
+                "crew_roles",
+                "crew_count",
+                "notes",
+            ]
+        ],
+        use_container_width=True,
+        column_config={
+            "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
+            "cost_per_hour": st.column_config.NumberColumn("Cost/hr", format="$%.2f"),
+            "total_cost": st.column_config.NumberColumn("Cost/Task", format="$%.2f"),
+            "crew_roles": st.column_config.TextColumn("Crew roles", width="medium"),
+            "notes": st.column_config.TextColumn("Notes", width="large"),
+        },
+        hide_index=True,
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("🗑️ Clear estimate", use_container_width=True):
+            st.session_state.estimate = []
+            st.rerun()
+    with c2:
+        if st.button("↩️ Remove last", use_container_width=True):
+            if st.session_state.estimate:
+                st.session_state.estimate.pop()
+                st.rerun()
+    with c3:
+        # CSV export
+        csv_buf = StringIO()
+        df_est.to_csv(csv_buf, index=False)
+        st.download_button(
+            "⬇️ Download CSV for Excel",
+            data=csv_buf.getvalue(),
+            file_name="estimate.csv",
+            mime="text/csv",
             use_container_width=True,
-            column_config={
-                "row":              st.column_config.NumberColumn("#", format="%.0f"),
-                "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
-                "cost_per_hour":    st.column_config.NumberColumn("Cost/hr", format="$%.2f"),
-                "total_cost":       st.column_config.NumberColumn("Cost/Task", format="$%.2f"),
-            },
-            hide_index=True,
         )
 
-        cA, cB, cC = st.columns([1,1,2])
-        with cA:
-            if st.button("🗑️ Clear estimate", use_container_width=True):
-                st.session_state.estimate = []
-                st.rerun()
-        with cB:
-            if st.button("↩️ Remove last", use_container_width=True):
-                if st.session_state.estimate:
-                    st.session_state.estimate.pop()
-                    st.rerun()
-        with cC:
-            buf = StringIO()
-            display_df.to_csv(buf, index=False)
-            st.download_button(
-                "⬇️ Download CSV for Excel",
-                data=buf.getvalue(),
-                file_name="estimate.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    st.metric("Estimate subtotal", f"${subtotal:,.2f}")
+    st.markdown("</div>", unsafe_allow_html=True)  # end estimate-box
+
+# Close main/right cell and grid
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
