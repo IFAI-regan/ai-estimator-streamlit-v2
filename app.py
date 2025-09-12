@@ -1,3 +1,5 @@
+st.sidebar.success("👋 This is the NEW sidebar layout.")
+
 # app.py
 import os
 import hashlib
