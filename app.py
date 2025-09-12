@@ -8,6 +8,8 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import streamlit as st
+import difflib
+import re
 
 # =========================================================
 # Page & Styles
@@ -68,13 +70,11 @@ if "estimate" not in st.session_state:
 if "last_lookup" not in st.session_state:
     st.session_state.last_lookup = None  # type: Optional[Dict]
 
-# Keys so we can reset just the Task after adding
 EQ_KEY = "eq_select"
 COMP_KEY = "comp_select"
 TASK_KEY = "task_select"
 
 def add_to_estimate(line: dict) -> bool:
-    """Append if not already in estimate (same equipment, component, task)."""
     for existing in st.session_state.estimate:
         if (
             existing.get("equipment_class") == line.get("equipment_class")
@@ -95,21 +95,18 @@ def estimate_df() -> pd.DataFrame:
             ]
         )
     df = pd.DataFrame(st.session_state.estimate)
-    # numeric formatting helpers
     for c in ["base_duration_hr", "cost_per_hour", "total_cost"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # row numbers (1-based)
     df.insert(0, "row", range(1, len(df) + 1))
     return df
 
-# Deterministic color from a string (component → light hex)
 def color_from_text(text: str) -> str:
     if not text:
         return "#D9D9D9"
     h = hashlib.md5(text.encode("utf-8")).hexdigest()
     r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
-    r = int(150 + (r / 255) * 90)  # 150–240
+    r = int(150 + (r / 255) * 90)
     g = int(150 + (g / 255) * 90)
     b = int(150 + (b / 255) * 90)
     return f"#{r:02X}{g:02X}{b:02X}"
@@ -154,7 +151,7 @@ def list_tasks(eq: str | None, comp: str | None) -> list[str]:
     return df["task_name"].tolist() if not df.empty else []
 
 # =========================================================
-# Inputs: cascading, searchable dropdowns (type-ahead built-in)
+# Inputs
 # =========================================================
 colA, colB = st.columns(2)
 equipment = colA.selectbox(
@@ -182,7 +179,6 @@ task_name = st.selectbox(
     disabled=not (st.session_state.get(EQ_KEY) and st.session_state.get(COMP_KEY)),
 )
 
-# Action buttons
 btn_col1, btn_col2 = st.columns([1, 1])
 lookup_disabled = not (equipment and component and task_name)
 with btn_col1:
@@ -211,7 +207,6 @@ if do_lookup:
     if df.empty:
         st.warning("No exact match found.")
     else:
-        # Derive cost_per_hour from available column(s)
         cost_col = None
         if "labour_rate" in df.columns:
             cost_col = "labour_rate"
@@ -229,10 +224,8 @@ if do_lookup:
         else:
             df["total_cost"] = None
 
-        # Save first row as last_lookup (so Add button survives reruns)
         st.session_state.last_lookup = df.iloc[0].to_dict()
 
-        # Metrics
         row = st.session_state.last_lookup
         dur = float(row.get("base_duration_hr") or 0)
         cph = float(row.get("cost_per_hour") or 0)
@@ -243,7 +236,6 @@ if do_lookup:
         m2.metric("Cost per hour", f"${cph:,.2f}" if cph else "—")
         m3.metric("Total cost (per task)", f"${tot:,.2f}" if tot else "—")
 
-        # Crew
         st.subheader("Crew")
         roles = str(row.get("crew_roles", "") or "").split("|")
         counts = str(row.get("crew_count", "") or "").split("|")
@@ -258,9 +250,7 @@ if do_lookup:
         else:
             st.caption("No crew information found.")
 
-        # Tidy one-row table (hide raw rate cols)
         tidy_df = pd.DataFrame([row]).copy()
-
         for col_to_drop in ["blended_labour_rate", "labour_rate", "cost_per_hr"]:
             if col_to_drop in tidy_df.columns:
                 tidy_df = tidy_df.drop(columns=[col_to_drop])
@@ -297,7 +287,7 @@ if do_lookup:
         )
 
 # =========================================================
-# Add to Estimate (uses persisted last_lookup)
+# Add to Estimate
 # =========================================================
 st.markdown("### Add to estimate")
 lr = st.session_state.last_lookup
@@ -316,8 +306,6 @@ if st.button("➕ Add this task", disabled=not can_add):
         "crew_count": lr.get("crew_count"),
         "notes": lr.get("notes"),
     }
-
-    # Add a soft color chip for readability (optional; keep if you already have color_from_text)
     try:
         line["component_color"] = color_from_text(line["component"])
     except Exception:
@@ -328,15 +316,10 @@ if st.button("➕ Add this task", disabled=not can_add):
     else:
         st.toast("Already in estimate", icon="ℹ️")
 
-    # --- Robustly clear just the Task selectbox and refresh the UI ---
-    # Remove the stored widget value instead of assigning directly;
-    # this avoids StreamlitAPIException on some builds.
     try:
         st.session_state.pop(TASK_KEY, None)
     except Exception:
         pass
-
-    # force a rebuild so the cleared value takes effect immediately
     st.rerun()
 
 # =========================================================
@@ -344,31 +327,6 @@ if st.button("➕ Add this task", disabled=not can_add):
 # =========================================================
 st.markdown("---")
 st.header("Estimate")
-
-def estimate_df() -> pd.DataFrame:
-    if not st.session_state.get("estimate"):
-        return pd.DataFrame(
-            columns=[
-                "row",
-                "equipment_class",
-                "component",
-                "task_name",
-                "task_code",
-                "base_duration_hr",
-                "cost_per_hour",
-                "total_cost",
-                "crew_roles",
-                "crew_count",
-                "notes",
-                # "component_color",  # include only if you’re generating it
-            ]
-        )
-    df = pd.DataFrame(st.session_state.estimate)
-    for c in ["base_duration_hr", "cost_per_hour", "total_cost"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df.insert(0, "row", range(1, len(df) + 1))
-    return df
 
 df_est = estimate_df()
 
@@ -379,7 +337,6 @@ else:
         "Filter estimate (search across task / equipment / component):",
         placeholder="Type to filter…",
     )
-
     display_df = df_est.copy()
     if filter_text:
         ft = filter_text.lower()
@@ -393,47 +350,27 @@ else:
     subtotal = pd.to_numeric(display_df.get("total_cost", 0), errors="coerce").sum()
 
     c1, c2 = st.columns([3, 1])
-
     with c1:
-        # Build column_config with safe fallback for ColorColumn
         col_config = {
             "row": st.column_config.NumberColumn("#", format="%.0f"),
             "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
             "cost_per_hour":    st.column_config.NumberColumn("Cost/hr",      format="$%.2f"),
             "total_cost":       st.column_config.NumberColumn("Cost/Task",    format="$%.2f"),
         }
-
         if "component_color" in display_df.columns:
             if hasattr(st.column_config, "ColorColumn"):
                 col_config["component_color"] = st.column_config.ColorColumn("Color")
             else:
-                # Fallback to plain text if ColorColumn isn't available
                 col_config["component_color"] = st.column_config.TextColumn("Color")
-
         cols_to_show = [
-            "row",
-            "equipment_class",
-            "component",
-            "task_name",
-            "task_code",
-            "base_duration_hr",
-            "cost_per_hour",
-            "total_cost",
-            "crew_roles",
-            "crew_count",
-            "notes",
+            "row", "equipment_class", "component", "task_name", "task_code",
+            "base_duration_hr", "cost_per_hour", "total_cost", "crew_roles",
+            "crew_count", "notes",
         ]
-        # Add color only if present
         if "component_color" in display_df.columns:
-            cols_to_show.insert(3, "component_color")  # place after component
-
+            cols_to_show.insert(3, "component_color")
         cols_to_show = [c for c in cols_to_show if c in display_df.columns]
-
-        st.dataframe(
-            display_df[cols_to_show],
-            use_container_width=True,
-            column_config=col_config,
-        )
+        st.dataframe(display_df[cols_to_show], use_container_width=True, column_config=col_config)
 
     with c2:
         st.metric("Estimate subtotal", f"${subtotal:,.2f}")
@@ -450,29 +387,82 @@ else:
                 st.rerun()
     with actC:
         csv_cols = [
-            "row",
-            "equipment_class",
-            "component",
-            "task_name",
-            "task_code",
-            "base_duration_hr",
-            "cost_per_hour",
-            "total_cost",
-            "crew_roles",
-            "crew_count",
-            "notes",
+            "row","equipment_class","component","task_name","task_code",
+            "base_duration_hr","cost_per_hour","total_cost","crew_roles",
+            "crew_count","notes",
         ]
         if "component_color" in df_est.columns:
             csv_cols.insert(3, "component_color")
-
         csv_out = df_est[[c for c in csv_cols if c in df_est.columns]].copy()
-
-        from io import StringIO
         buf = StringIO()
         csv_out.to_csv(buf, index=False)
-        st.download_button(
-            "⬇️ Download CSV for Excel",
-            data=buf.getvalue(),
-            file_name="estimate.csv",
-            mime="text/csv",
-        )
+        st.download_button("⬇️ Download CSV for Excel", data=buf.getvalue(), file_name="estimate.csv", mime="text/csv")
+
+# =========================================================
+# Batch import & fuzzy match
+# =========================================================
+st.markdown("---")
+st.header("Batch import & fuzzy match")
+
+st.caption("Upload a CSV with columns like **task**, **equipment**, **component** (and optional **quantity**).")
+
+@st.cache_data(show_spinner=False)
+def load_catalog() -> pd.DataFrame:
+    df = run_sql(
+        """
+        SELECT equipment_class, component, task_name, task_code,
+               base_duration_hr, COALESCE(labour_rate, blended_labour_rate) AS labour_rate
+        FROM task_norms_view
+        """
+    )
+    if "base_duration_hr" in df.columns:
+        df["base_duration_hr"] = pd.to_numeric(df["base_duration_hr"], errors="coerce").fillna(0.0)
+    if "labour_rate" in df.columns:
+        df["labour_rate"] = pd.to_numeric(df["labour_rate"], errors="coerce").fillna(0.0)
+    df["cost_per_task"] = (df["base_duration_hr"] * df["labour_rate"]).round(2)
+    for c in ("equipment_class","component","task_name"):
+        df[f"{c}__lc"] = df[c].astype(str).str.lower().str.strip()
+    return df
+
+CATALOG = load_catalog()
+
+def _norm(s: str) -> str:
+    if s is None: return ""
+    s = re.sub(r"[^a-zA-Z0-9\s]+", " ", str(s))
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def infer_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in cols_lower:
+            return cols_lower[cand]
+    for c in df.columns:
+        for cand in candidates:
+            if cand in c.lower():
+                return c
+    return None
+
+def best_match(value: str, choices: list[str]) -> tuple[str, float]:
+    if not value or not choices:
+        return "", 0.0
+    value = _norm(value)
+    pick = difflib.get_close_matches(value, choices, n=1, cutoff=0)
+    if pick:
+        choice = pick[0]
+    else:
+        choice = choices[0]
+    ratio = difflib.SequenceMatcher(a=value, b=choice).ratio()
+    return choice, ratio
+
+def fuzzy_match_row(row: dict, catalog: pd.DataFrame) -> dict:
+    eq_in  = _norm(row.get("equipment", ""))
+    comp_in= _norm(row.get("component", ""))
+    task_in= _norm(row.get("task", ""))
+    eq_choices   = sorted(catalog["equipment_class__lc"].unique().tolist())
+    comp_choices = sorted(catalog["component__lc"].unique().tolist())
+    task_choices = sorted(catalog["task_name__lc"].unique().tolist())
+    best_eq, r_eq   = best_match(eq_in,   eq_choices)   if eq_in else ("", 0.0)
+    best_comp,r_comp= best_match(comp_in, comp_choices) if comp_in else ("", 0.0)
+    best_task,r_task= best_match(task_in, task_choices) if task_in else ("", 0.0)
+   
