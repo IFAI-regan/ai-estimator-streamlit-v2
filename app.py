@@ -1,47 +1,49 @@
 # app.py
-
-import os
 import hashlib
 from io import StringIO
 from typing import Optional, List, Dict, Tuple
-import difflib
 
 import pandas as pd
 import psycopg2
 import psycopg2.extras
 import streamlit as st
 
+# Try rapidfuzz for better speed/quality; fall back to difflib if not present
+try:
+    from rapidfuzz import fuzz
+    def str_ratio(a: str, b: str) -> float:
+        return float(fuzz.token_set_ratio(a, b))  # 0..100
+except Exception:
+    from difflib import SequenceMatcher
+    def str_ratio(a: str, b: str) -> float:
+        return 100.0 * SequenceMatcher(None, a, b).ratio()
+
 # =========================================================
-# Page & Styles
+# Page layout & small CSS polish
 # =========================================================
 st.set_page_config(page_title="Maintenance Task Lookup", layout="wide")
 
 st.title("Phase 1 — Exact Name Recall")
-st.caption("Supabase → task_norms_view")
+VIEW_FQN = st.secrets.get("VIEW_FQN", "task_norms_view")
+st.caption(f"Supabase → {VIEW_FQN}")
 
 st.markdown(
     """
     <style>
       .stMetric span { font-size: 14px !important; }
       .stDataFrame { font-size: 14px; }
-      /* Make sidebar a touch tighter */
-      section[data-testid="stSidebar"] div[role="radiogroup"],
-      section[data-testid="stSidebar"] .stMarkdown { margin-bottom: .5rem; }
-      .small-badge {
-        padding: 4px 8px; border-radius: 6px; display:inline-block;
-        font-size: 12px; background:#EEF8F0; color:#106A2A;
-      }
-      .small-badge.fail { background:#FDEAEA; color:#8A0E0E; }
+      /* Make sidebar sections a bit tighter */
+      section[data-testid="stSidebar"] .block-container {padding-top: 0.8rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # =========================================================
-# Config / Secrets
+# DB helpers
 # =========================================================
 if "DATABASE_URL" not in st.secrets:
-    st.error(
+    st.sidebar.error(
         "Missing secret `DATABASE_URL`.\n\n"
         "In Streamlit → Settings → Secrets add:\n"
         'DATABASE_URL = "postgresql://postgres.<project>:[PASSWORD]@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"'
@@ -49,17 +51,16 @@ if "DATABASE_URL" not in st.secrets:
     st.stop()
 
 DATABASE_URL = st.secrets["DATABASE_URL"].strip()
-VIEW_FQN = st.secrets.get("VIEW_FQN", "task_norms_view").strip()  # optional override
 
-# =========================================================
-# DB connection + resilient SQL runner (auto-reconnect)
-# =========================================================
 @st.cache_resource
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-def run_sql(query: str, params=None, _retry=True) -> pd.DataFrame:
-    """Run SQL and auto-reconnect once on OperationalError."""
+def run_sql(query: str, params=None) -> pd.DataFrame:
+    """
+    Execute SQL and return a DataFrame. Defensive: if the connection has gone
+    stale, it retries once by rebuilding the cached connection.
+    """
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params or [])
@@ -67,40 +68,38 @@ def run_sql(query: str, params=None, _retry=True) -> pd.DataFrame:
                 return pd.DataFrame()
             rows = cur.fetchall()
             return pd.DataFrame(rows, columns=[d.name for d in cur.description])
-
-    except psycopg2.OperationalError:
-        # clear cached connection and retry once
-        if _retry:
-            try:
-                get_conn.clear()
-            except Exception:
-                pass
-            return run_sql(query, params, _retry=False)
-        raise
-
-def db_status_badge() -> None:
-    try:
-        _ = run_sql("select 1 as ok;")
-        st.sidebar.markdown('<span class="small-badge">DB connection OK</span>', unsafe_allow_html=True)
     except Exception:
-        st.sidebar.markdown('<span class="small-badge fail">DB connection failed</span>', unsafe_allow_html=True)
+        # Retry once with a fresh connection
+        get_conn.clear()  # drop cached connection
+        with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params or [])
+            if cur.description is None:
+                return pd.DataFrame()
+            rows = cur.fetchall()
+            return pd.DataFrame(rows, columns=[d.name for d in cur.description])
 
-db_status_badge()  # compact indicator in the sidebar
+# Connection badge (sidebar so it never overlaps main UI)
+try:
+    _ = run_sql("select 1 as ok;")
+    st.sidebar.success("Database connection OK", icon="✅")
+except Exception as e:
+    st.sidebar.error("Database connection failed", icon="❌")
+    st.stop()
 
 # =========================================================
-# Session state (estimate & last lookup; widget keys)
+# Session state
 # =========================================================
 if "estimate" not in st.session_state:
-    st.session_state.estimate = []  # type: List[Dict]
+    st.session_state.estimate: List[Dict] = []
 if "last_lookup" not in st.session_state:
-    st.session_state.last_lookup = None  # type: Optional[Dict]
-
+    st.session_state.last_lookup: Optional[Dict] = None
+# Widget keys so we can clear only the Task name
 EQ_KEY = "eq_select"
 COMP_KEY = "comp_select"
 TASK_KEY = "task_select"
 
 # =========================================================
-# Utility: Color chip from text
+# Utility helpers
 # =========================================================
 def color_from_text(text: str) -> str:
     if not text:
@@ -112,80 +111,8 @@ def color_from_text(text: str) -> str:
     b = int(150 + (b / 255) * 90)
     return f"#{r:02X}{g:02X}{b:02X}"
 
-# =========================================================
-# Helper queries for dropdowns
-# =========================================================
-def list_equipment() -> list[str]:
-    df = run_sql(
-        f"SELECT DISTINCT equipment_class FROM {VIEW_FQN} ORDER BY equipment_class;"
-    )
-    return df["equipment_class"].tolist() if not df.empty else []
-
-def list_components(eq: str | None) -> list[str]:
-    if not eq:
-        return []
-    df = run_sql(
-        f"""
-        SELECT DISTINCT component
-        FROM {VIEW_FQN}
-        WHERE equipment_class = %s
-        ORDER BY component;
-        """,
-        [eq],
-    )
-    return df["component"].tolist() if not df.empty else []
-
-def list_tasks(eq: str | None, comp: str | None) -> list[str]:
-    if not (eq and comp):
-        return []
-    df = run_sql(
-        f"""
-        SELECT task_name
-        FROM {VIEW_FQN}
-        WHERE equipment_class = %s
-          AND component = %s
-        GROUP BY task_name
-        ORDER BY task_name;
-        """,
-        [eq, comp],
-    )
-    return df["task_name"].tolist() if not df.empty else []
-
-# =========================================================
-# Exact lookup + compute costs (also used by batch importer)
-# =========================================================
-def lookup_exact_task(eq: str, comp: str, task: str) -> dict | None:
-    df = run_sql(
-        f"""
-        SELECT *
-        FROM {VIEW_FQN}
-        WHERE equipment_class = %s
-          AND component       = %s
-          AND task_name       = %s
-        LIMIT 1;
-        """,
-        [eq, comp, task],
-    )
-    return df.iloc[0].to_dict() if not df.empty else None
-
-def compute_costs(row: dict, qty: float = 1.0) -> Tuple[float, float]:
-    """Return (cost_per_hour, total_cost) given a DB row and optional quantity."""
-    rate = row.get("labour_rate")
-    if rate in (None, "", "None"):
-        rate = row.get("blended_labour_rate")
-    cph = pd.to_numeric(rate, errors="coerce")
-    dur = pd.to_numeric(row.get("base_duration_hr"), errors="coerce")
-    q = pd.to_numeric(qty, errors="coerce")
-    if pd.isna(cph): cph = 0.0
-    if pd.isna(dur): dur = 0.0
-    if pd.isna(q):   q = 1.0
-    return float(cph), float(round(cph * dur * q, 2))
-
-# =========================================================
-# Estimate helpers
-# =========================================================
-def add_to_estimate(line: dict) -> bool:
-    """Append if not already in estimate (same equipment, component, task)."""
+def add_to_estimate(line: Dict) -> bool:
+    """Append if combination not already present."""
     for existing in st.session_state.estimate:
         if (
             existing.get("equipment_class") == line.get("equipment_class")
@@ -202,7 +129,7 @@ def estimate_df() -> pd.DataFrame:
             columns=[
                 "row", "equipment_class", "component", "task_name", "task_code",
                 "base_duration_hr", "cost_per_hour", "total_cost",
-                "component_color", "crew_roles", "crew_count", "notes"
+                "crew_roles", "crew_count", "notes"
             ]
         )
     df = pd.DataFrame(st.session_state.estimate)
@@ -212,180 +139,249 @@ def estimate_df() -> pd.DataFrame:
     df.insert(0, "row", range(1, len(df) + 1))
     return df
 
+def derive_costs(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive cost_per_hour and total_cost in-place using available columns."""
+    if "cost_per_hour" not in df.columns:
+        df["cost_per_hour"] = None
+
+    # Prefer labour_rate; fall back to blended_labour_rate if present
+    if "labour_rate" in df.columns and df["labour_rate"].notna().any():
+        df["cost_per_hour"] = pd.to_numeric(df["labour_rate"], errors="coerce")
+    elif "blended_labour_rate" in df.columns and df["blended_labour_rate"].notna().any():
+        df["cost_per_hour"] = pd.to_numeric(df["blended_labour_rate"], errors="coerce")
+
+    if "base_duration_hr" in df.columns:
+        df["base_duration_hr"] = pd.to_numeric(df["base_duration_hr"], errors="coerce")
+    else:
+        df["base_duration_hr"] = pd.NA
+
+    df["total_cost"] = (df["cost_per_hour"] * df["base_duration_hr"]).round(2)
+    return df
+
 # =========================================================
-# LEFT: Find a task (sidebar) + Batch import
+# Catalog for fuzzy matching (SELECT * to avoid UndefinedColumn)
 # =========================================================
-st.sidebar.header("Find a task")
-equipment = st.sidebar.selectbox(
-    "Equipment Class",
-    options=list_equipment(),
-    index=None,
-    key=EQ_KEY,
-    placeholder="Type to search… e.g., Stacker Reclaimer",
-)
-component = st.sidebar.selectbox(
-    "Component",
-    options=list_components(st.session_state.get(EQ_KEY)),
-    index=None,
-    key=COMP_KEY,
-    placeholder="Select component…",
-    disabled=(st.session_state.get(EQ_KEY) is None),
-)
+@st.cache_data(show_spinner=False, ttl=60)
+def load_catalog(view_fqn: str) -> pd.DataFrame:
+    df = run_sql(f"SELECT * FROM {view_fqn};")
+    # Normalize explicit columns if missing
+    for col in ["equipment_class", "component", "task_name"]:
+        if col not in df.columns:
+            df[col] = None
+    # Build a normalized key to match against
+    def _norm(s: Optional[str]) -> str:
+        if pd.isna(s) or s is None:
+            return ""
+        return " ".join(str(s).strip().lower().split())
+    df["_norm_equipment"] = df["equipment_class"].map(_norm)
+    df["_norm_component"] = df["component"].map(_norm)
+    df["_norm_task"] = df["task_name"].map(_norm)
+    df["_norm_join"] = (
+        df["_norm_equipment"] + " | " + df["_norm_component"] + " | " + df["_norm_task"]
+    )
+    return df
 
-task_name = st.sidebar.selectbox(
-    "Task Name (exact)",
-    options=list_tasks(st.session_state.get(EQ_KEY), st.session_state.get(COMP_KEY)),
-    index=None,
-    key=TASK_KEY,
-    placeholder=("Select equipment & component first"
-                 if not (st.session_state.get(EQ_KEY) and st.session_state.get(COMP_KEY))
-                 else "Select a task…"),
-    disabled=not (st.session_state.get(EQ_KEY) and st.session_state.get(COMP_KEY)),
-)
+CATALOG = load_catalog(VIEW_FQN)
 
-lookup_disabled = not (equipment and component and task_name)
+# =========================================================
+# Sidebar — Find a task + Batch import
+# =========================================================
+with st.sidebar:
+    st.header("Find a task")
 
-col_btn1, col_btn2 = st.sidebar.columns([1, 1])
-with col_btn1:
-    do_lookup = st.button("Lookup", type="primary", disabled=lookup_disabled, use_container_width=True)
-with col_btn2:
-    if st.button("Clear selections", use_container_width=True):
-        st.session_state.last_lookup = None
-        st.session_state[TASK_KEY] = None
-        st.rerun()
+    # Dropdown helpers
+    @st.cache_data(show_spinner=False, ttl=30)
+    def list_equipment() -> list[str]:
+        df = run_sql(f"SELECT DISTINCT equipment_class FROM {VIEW_FQN} ORDER BY equipment_class;")
+        return df["equipment_class"].dropna().tolist() if not df.empty else []
 
-# -------- Batch import (CSV) + fuzzy match (SIDEBAR) --------
-def _norm(s: str | None) -> str:
-    return (s or "").strip()
+    @st.cache_data(show_spinner=False, ttl=30)
+    def list_components(eq: Optional[str]) -> list[str]:
+        if not eq:
+            return []
+        df = run_sql(
+            f"""
+            SELECT DISTINCT component
+            FROM {VIEW_FQN}
+            WHERE equipment_class = %s
+            ORDER BY component;
+            """,
+            [eq],
+        )
+        return df["component"].dropna().tolist() if not df.empty else []
 
-@st.cache_data(show_spinner=False)
-def load_catalog() -> pd.DataFrame:
-    """Cache a slim catalog to fuzzy match against; keep it stable across reruns."""
-    return run_sql(
-        f"""
-        SELECT
-          equipment_class, component, task_name,
-          base_duration_hr, labour_rate, blended_labour_rate,
-          task_code, crew_roles, crew_count, notes
-        FROM {VIEW_FQN};
-        """
+    @st.cache_data(show_spinner=False, ttl=30)
+    def list_tasks(eq: Optional[str], comp: Optional[str]) -> list[str]:
+        if not (eq and comp):
+            return []
+        df = run_sql(
+            f"""
+            SELECT task_name
+            FROM {VIEW_FQN}
+            WHERE equipment_class = %s
+              AND component = %s
+            GROUP BY task_name
+            ORDER BY task_name;
+            """,
+            [eq, comp],
+        )
+        return df["task_name"].dropna().tolist() if not df.empty else []
+
+    equipment = st.selectbox(
+        "Equipment Class",
+        options=list_equipment(),
+        index=None,
+        key=EQ_KEY,
+        placeholder="Type to search… e.g., Stacker Reclaimer",
+    )
+    component = st.selectbox(
+        "Component",
+        options=list_components(st.session_state.get(EQ_KEY)),
+        index=None,
+        key=COMP_KEY,
+        placeholder="Select component…",
+        disabled=(st.session_state.get(EQ_KEY) is None),
+    )
+    task_name = st.selectbox(
+        "Task Name (exact)",
+        options=list_tasks(st.session_state.get(EQ_KEY), st.session_state.get(COMP_KEY)),
+        index=None,
+        key=TASK_KEY,
+        placeholder=("Select equipment & component first"
+                     if not (st.session_state.get(EQ_KEY) and st.session_state.get(COMP_KEY))
+                     else "Select a task…"),
+        disabled=not (st.session_state.get(EQ_KEY) and st.session_state.get(COMP_KEY)),
     )
 
-with st.sidebar.expander("📦 Batch import (CSV)", expanded=True):
-    st.caption("Columns (required): **task**, **equipment**, **component**. Optional: **quantity**.")
-    sensitivity = st.slider("Match sensitivity (higher = stricter)", 0, 100, 75,
-                            help="Uses fuzzy match on task name; equipment & component are expected to match exactly.")
+    c_btn1, c_btn2 = st.columns(2)
+    with c_btn1:
+        lookup_disabled = not (equipment and component and task_name)
+        do_lookup = st.button("Lookup", type="primary", disabled=lookup_disabled)
+    with c_btn2:
+        if st.button("Clear selections"):
+            st.session_state.last_lookup = None
+            st.session_state[TASK_KEY] = None
+            st.rerun()
 
-    uploaded_file = st.file_uploader("Drag and drop file here", type=["csv"], label_visibility="collapsed")
+    st.divider()
+    st.subheader("📦 Batch import (CSV)")
+    st.caption("Columns (required): **task**, **equipment**, **component**. Optional: **quantity**")
 
-    if uploaded_file is not None:
+    # Match sensitivity
+    sens = st.slider("Match sensitivity (higher = stricter)", min_value=50, max_value=95, value=76)
+
+    # CSV uploader
+    up = st.file_uploader("Drag and drop file here", type=["csv"], label_visibility="collapsed")
+    if up is not None:
         try:
-            raw = pd.read_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
-            raw = pd.DataFrame()
+            df_in = pd.read_csv(up)
+        except Exception:
+            st.error("Could not read CSV. Make sure it's a valid CSV file.")
+            df_in = None
 
-        # Normalize column names
-        rename_map = {
-            "task": "task",
-            "Task": "task",
-            "equipment": "equipment",
-            "Equipment": "equipment",
-            "component": "component",
-            "Component": "component",
-            "quantity": "quantity",
-            "Quantity": "quantity",
-            "qty": "quantity",
-            "Qty": "quantity",
-        }
-        raw = raw.rename(columns={c: rename_map.get(c, c) for c in raw.columns})
-
-        missing = [c for c in ["task", "equipment", "component"] if c not in raw.columns]
-        if missing:
-            st.error(f"Missing required columns: {', '.join(missing)}")
-        else:
-            cat = load_catalog()
-            added = 0
-            for _, r in raw.iterrows():
-                task_in = _norm(r.get("task"))
-                eq_in   = _norm(r.get("equipment"))
-                comp_in = _norm(r.get("component"))
-                qty_in  = r.get("quantity", 1)
-
-                if not (task_in and eq_in and comp_in):
-                    continue
-
-                # Filter catalog by exact eq/component first (fast narrow)
-                sub = cat.loc[(cat["equipment_class"] == eq_in) & (cat["component"] == comp_in)]
-                if sub.empty:
-                    # fall back to whole catalog (looser)
-                    sub = cat
-
-                # Fuzzy match only on task_name for simplicity
-                sub = sub.assign(
-                    _score=sub["task_name"].apply(lambda x: int(100 * difflib.SequenceMatcher(None, task_in.lower(), str(x).lower()).ratio()))
-                ).sort_values("_score", ascending=False)
-
-                if sub.empty or int(sub.iloc[0]["_score"]) < sensitivity:
-                    # no acceptable match
-                    continue
-
-                best = sub.iloc[0]
-                matched_task = best["task_name"]
-                matched_eq   = best["equipment_class"]
-                matched_comp = best["component"]
-
-                # Re-query authoritative row (so we always compute correct costs)
-                row = lookup_exact_task(matched_eq, matched_comp, matched_task)
-                if not row:
-                    continue
-
-                cost_per_hr, total_cost = compute_costs(row, qty=qty_in)
-
-                line = {
-                    "equipment_class": row.get("equipment_class"),
-                    "component": row.get("component"),
-                    "task_name": row.get("task_name"),
-                    "task_code": row.get("task_code"),
-                    "base_duration_hr": float(pd.to_numeric(row.get("base_duration_hr"), errors="coerce") or 0),
-                    "cost_per_hour": cost_per_hr,
-                    "total_cost": total_cost,
-                    "crew_roles": row.get("crew_roles"),
-                    "crew_count": row.get("crew_count"),
-                    "notes": row.get("notes"),
-                    "component_color": color_from_text(row.get("component")),
-                }
-                if add_to_estimate(line):
-                    added += 1
-
-            if added:
-                st.success(f"Imported **{added}** task(s) from CSV.", icon="✅")
+        if df_in is not None:
+            # Normalize expected columns
+            cols_lower = {c.lower(): c for c in df_in.columns}
+            required = ["task", "equipment", "component"]
+            missing = [c for c in required if c not in cols_lower]
+            if missing:
+                st.error(f"Missing required column(s): {', '.join(missing)}")
             else:
-                st.info("No rows imported (no matches >= sensitivity).", icon="ℹ️")
+                task_col = cols_lower["task"]
+                equip_col = cols_lower["equipment"]
+                comp_col = cols_lower["component"]
+                qty_col = cols_lower.get("quantity", None)
+
+                def _norm(s: Optional[str]) -> str:
+                    if pd.isna(s) or s is None:
+                        return ""
+                    return " ".join(str(s).strip().lower().split())
+
+                imported = 0
+                for _, row in df_in.iterrows():
+                    q = 1
+                    if qty_col and not pd.isna(row.get(qty_col)):
+                        try:
+                            q = int(row[qty_col])
+                        except Exception:
+                            q = 1
+
+                    key = _norm(row.get(equip_col)) + " | " + _norm(row.get(comp_col)) + " | " + _norm(row.get(task_col))
+
+                    # Find best match in catalog
+                    CATALOG["_tmp_score"] = CATALOG["_norm_join"].map(lambda s: str_ratio(key, s))
+                    best = CATALOG.sort_values("_tmp_score", ascending=False).head(1)
+                    if best.empty or float(best["_tmp_score"].iloc[0]) < sens:
+                        continue  # skip low-confidence match
+
+                    match_row = best.iloc[0].to_dict()
+
+                    # Build line item (derive costs)
+                    line = {
+                        "equipment_class": match_row.get("equipment_class"),
+                        "component": match_row.get("component"),
+                        "task_name": match_row.get("task_name"),
+                        "task_code": match_row.get("task_code"),
+                        "base_duration_hr": match_row.get("base_duration_hr"),
+                        "crew_roles": match_row.get("crew_roles"),
+                        "crew_count": match_row.get("crew_count"),
+                        "notes": match_row.get("notes"),
+                    }
+
+                    temp_df = pd.DataFrame([match_row])
+                    temp_df = derive_costs(temp_df)
+                    line["cost_per_hour"] = float(temp_df["cost_per_hour"].iloc[0] or 0)
+                    line["total_cost"] = float(temp_df["total_cost"].iloc[0] or 0)
+
+                    # Add color chip (optional)
+                    try:
+                        line["component_color"] = color_from_text(line["component"])
+                    except Exception:
+                        pass
+
+                    # Add quantity copies (simple multiply: duplicate rows)
+                    for _i in range(max(q, 1)):
+                        if add_to_estimate(line.copy()):
+                            imported += 1
+
+                if imported:
+                    st.success(f"Imported {imported} task(s) from CSV.", icon="✅")
+                else:
+                    st.warning("No rows imported (low confidence or no matches).")
 
 # =========================================================
-# MAIN: Lookup & Present
+# Lookup & Present (main area)
 # =========================================================
+if "do_lookup" not in locals():
+    do_lookup = False
+
 if do_lookup:
-    row = lookup_exact_task(equipment, component, task_name)
+    df = run_sql(
+        f"""
+        SELECT *
+        FROM {VIEW_FQN}
+        WHERE equipment_class = %s
+          AND component = %s
+          AND task_name = %s;
+        """,
+        [equipment, component, task_name],
+    )
 
-    if not row:
+    if df.empty:
         st.warning("No exact match found.")
     else:
-        # Compute costs for single task
-        cost_per_hr, total_cost = compute_costs(row, qty=1)
-        row["cost_per_hour"] = cost_per_hr
-        row["total_cost"] = total_cost
+        df = derive_costs(df)
+        st.session_state.last_lookup = df.iloc[0].to_dict()
 
-        # Persist last_lookup so "Add this task" survives reruns
-        st.session_state.last_lookup = row
+        row = st.session_state.last_lookup
+        dur = float(row.get("base_duration_hr") or 0)
+        cph = float(row.get("cost_per_hour") or 0)
+        tot = float(row.get("total_cost") or 0)
 
-        # Metrics row
         m1, m2, m3 = st.columns(3)
-        dur = float(pd.to_numeric(row.get("base_duration_hr"), errors="coerce") or 0)
         m1.metric("Duration (hr)", f"{dur:.2f}" if dur else "—")
-        m2.metric("Cost per hour", f"${cost_per_hr:,.2f}" if cost_per_hr else "—")
-        m3.metric("Total cost (per task)", f"${total_cost:,.2f}" if total_cost else "—")
+        m2.metric("Cost per hour", f"${cph:,.2f}" if cph else "—")
+        m3.metric("Total cost (per task)", f"${tot:,.2f}" if tot else "—")
 
         # Crew
         st.subheader("Crew")
@@ -402,7 +398,7 @@ if do_lookup:
         else:
             st.caption("No crew information found.")
 
-        # Clean one-row view table
+        # One-row tidy table
         tidy_df = pd.DataFrame([row]).copy()
         for col_to_drop in ["blended_labour_rate", "labour_rate", "cost_per_hr"]:
             if col_to_drop in tidy_df.columns:
@@ -429,45 +425,41 @@ if do_lookup:
         )
 
 # =========================================================
-# Add to Estimate (uses persisted last_lookup)
+# Add to Estimate
 # =========================================================
-st.markdown("### Add to estimate")
+st.subheader("Add to estimate")
 lr = st.session_state.last_lookup
-can_add = bool(lr) and (lr.get("total_cost") is not None)
+can_add = bool(lr) and lr.get("total_cost") is not None
 
 if st.button("➕ Add this task", disabled=not can_add):
-    row = lr
-    cost_per_hr = float(pd.to_numeric(row.get("cost_per_hour"), errors="coerce") or 0)
-    total_cost  = float(pd.to_numeric(row.get("total_cost"), errors="coerce") or 0)
-
     line = {
-        "equipment_class": row.get("equipment_class"),
-        "component": row.get("component"),
-        "task_name": row.get("task_name"),
-        "task_code": row.get("task_code"),
-        "base_duration_hr": float(pd.to_numeric(row.get("base_duration_hr"), errors="coerce") or 0),
-        "cost_per_hour": cost_per_hr,
-        "total_cost": total_cost,
-        "crew_roles": row.get("crew_roles"),
-        "crew_count": row.get("crew_count"),
-        "notes": row.get("notes"),
-        "component_color": color_from_text(row.get("component")),
+        "equipment_class": lr.get("equipment_class"),
+        "component": lr.get("component"),
+        "task_name": lr.get("task_name"),
+        "task_code": lr.get("task_code"),
+        "base_duration_hr": float(lr.get("base_duration_hr") or 0),
+        "cost_per_hour": float(lr.get("cost_per_hour") or 0),
+        "total_cost": float(lr.get("total_cost") or 0),
+        "crew_roles": lr.get("crew_roles"),
+        "crew_count": lr.get("crew_count"),
+        "notes": lr.get("notes"),
     }
+    try:
+        line["component_color"] = color_from_text(line["component"])
+    except Exception:
+        pass
 
     if add_to_estimate(line):
         st.toast("Added to estimate ✅", icon="✅")
     else:
         st.toast("Already in estimate", icon="ℹ️")
 
-    # Clear just the Task selectbox safely and refresh
-    try:
-        st.session_state.pop(TASK_KEY, None)
-    except Exception:
-        pass
+    # clear just the task dropdown and rerun
+    st.session_state.pop(TASK_KEY, None)
     st.rerun()
 
 # =========================================================
-# Estimate
+# Estimate section
 # =========================================================
 st.markdown("---")
 st.header("Estimate")
@@ -475,7 +467,7 @@ st.header("Estimate")
 df_est = estimate_df()
 
 if df_est.empty:
-    st.caption("No tasks added yet. Lookup a task or use **Batch import (CSV)**, then click **Add to estimate**.")
+    st.caption("No tasks added yet. Lookup a task or use **Batch import**.")
 else:
     filter_text = st.text_input(
         "Filter estimate (search across task / equipment / component):",
@@ -495,20 +487,15 @@ else:
     subtotal = pd.to_numeric(display_df.get("total_cost", 0), errors="coerce").sum()
 
     c1, c2 = st.columns([3, 1])
-
     with c1:
         col_config = {
             "row": st.column_config.NumberColumn("#", format="%.0f"),
             "base_duration_hr": st.column_config.NumberColumn("Duration (hr)", format="%.2f"),
             "cost_per_hour":    st.column_config.NumberColumn("Cost/hr",      format="$%.2f"),
             "total_cost":       st.column_config.NumberColumn("Cost/Task",    format="$%.2f"),
+            "crew_roles":       st.column_config.TextColumn("Crew roles", help="‘|’ separated"),
+            "notes":            st.column_config.TextColumn("Notes"),
         }
-        if "component_color" in display_df.columns:
-            if hasattr(st.column_config, "ColorColumn"):
-                col_config["component_color"] = st.column_config.ColorColumn("Color")
-            else:
-                col_config["component_color"] = st.column_config.TextColumn("Color")
-
         cols_to_show = [
             "row",
             "equipment_class",
@@ -523,16 +510,20 @@ else:
             "notes",
         ]
         if "component_color" in display_df.columns:
+            # place color after component if present
             cols_to_show.insert(3, "component_color")
+            # Use TextColumn if ColorColumn not available in your build
+            if hasattr(st.column_config, "ColorColumn"):
+                col_config["component_color"] = st.column_config.ColorColumn("Color")
+            else:
+                col_config["component_color"] = st.column_config.TextColumn("Color")
 
         cols_to_show = [c for c in cols_to_show if c in display_df.columns]
-
         st.dataframe(
             display_df[cols_to_show],
             use_container_width=True,
             column_config=col_config,
         )
-
     with c2:
         st.metric("Estimate subtotal", f"${subtotal:,.2f}")
 
