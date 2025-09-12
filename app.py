@@ -249,7 +249,7 @@ col_btn1, col_btn2 = st.sidebar.columns([1, 1])
 with col_btn1:
     do_lookup = st.button("Lookup", type="primary", disabled=lookup_disabled, use_container_width=True)
 with col_btn2:
-    if st.button("Clear selections", use_container_width=True):
+    if st.button("Clear", use_container_width=True):
         st.session_state.last_lookup = None
         st.session_state[TASK_KEY] = None
         st.rerun()
