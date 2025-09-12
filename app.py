@@ -1,3 +1,16 @@
+import os, pathlib
+import streamlit as st
+
+VERSION = "v2.1-sidebar-2025-09-12-22:45"
+st.set_page_config(page_title=f"Estimator ({VERSION})", layout="wide")
+
+# Big, unmistakable markers that this file is the one running
+st.sidebar.success(f"✅ Loaded code version: {VERSION}")
+try:
+    st.caption(f"cwd={os.getcwd()}  •  file={pathlib.Path(__file__).resolve()}")
+except Exception:
+    pass
+
 st.sidebar.success("👋 This is the NEW sidebar layout.")
 
 # app.py
