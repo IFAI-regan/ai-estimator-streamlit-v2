@@ -1,0 +1,19 @@
+# AI Estimator (Streamlit)
+
+Stable checkpoint: **v1.0-phase1**
+
+## Branches
+- **main** – production (stable)
+- **develop** – staging / integration
+- **feature/*** – one branch per feature
+
+## Deployments
+- Streamlit (prod) → `main`
+- Streamlit (staging) → `develop`
+
+## Secrets (Streamlit)
+- `DATABASE_URL` (pooler) **or**
+- `PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`, `PG_PASSWORD`
+
+## Tags
+- `v1.0-phase1` – Phase 1 exact-name recall working
